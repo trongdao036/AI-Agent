@@ -1,4 +1,5 @@
 ai-learning-backend/venv/
 ai-learning-backend/chroma_db/
+ai-learning-backend/.env/
 ai-learning-backend/uploads/
 ai-learning-frontend/node_modules/
