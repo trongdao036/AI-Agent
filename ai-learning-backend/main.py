@@ -6,15 +6,17 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma  # Import chuẩn mới
+from langchain_chroma import Chroma
 import google.generativeai as genai
 
 # Import các Agent
 from agents.content_agent import ContentAgent
 from agents.assessment_agent import AssessmentAgent
+# [MỚI] Import Profiling Agent
+from agents.profiling_agent import ProfilingAgent
 
 # ============================================================================
-# 1. CẤU HÌNH MÔI TRƯỜNG & API KEY
+# 1. CẤU HÌNH MÔI TRƯỜNG
 # ============================================================================
 load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY")
@@ -25,11 +27,10 @@ else:
     genai.configure(api_key=API_KEY)
 
 # ============================================================================
-# 2. CẤU HÌNH SERVER & THƯ MỤC
+# 2. CẤU HÌNH SERVER
 # ============================================================================
 app = FastAPI()
 
-# Cấp quyền cho Frontend (CORS) - Quan trọng để React gọi được API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,56 +38,47 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Đường dẫn tuyệt đối
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 DB_DIR = os.path.join(BASE_DIR, "chroma_db")
 METADATA_FILE = os.path.join(BASE_DIR, "metadata.json")
 
-# Tạo thư mục nếu chưa có
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ============================================================================
-# 3. KHỞI TẠO CÁC AGENT & CÔNG CỤ
+# 3. KHỞI TẠO AGENTS
 # ============================================================================
-print("⏳ Đang tải mô hình Embedding (Lần đầu sẽ hơi lâu)...")
+print("⏳ Đang tải mô hình Embedding...")
 try:
     embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    print("✅ Đã tải xong Embedding Model.")
+    vector_db = Chroma(persist_directory=DB_DIR, embedding_function=embedding_model)
+    print("✅ Đã kết nối Vector DB.")
 except Exception as e:
-    print(f"❌ Lỗi tải Embedding Model: {e}")
+    print(f"❌ Lỗi khởi tạo AI: {e}")
     exit(1)
 
-print("🔌 Đang kết nối Vector Database...")
-# Lưu ý: Cần dùng đúng thư viện langchain_chroma
-vector_db = Chroma(persist_directory=DB_DIR, embedding_function=embedding_model)
-
-# Khởi tạo các Worker (Agent)
+# Khởi tạo 3 Workers chính
 content_worker = ContentAgent(embedding_model, DB_DIR)
 assessment_worker = AssessmentAgent(vector_db, API_KEY)
+profiling_worker = ProfilingAgent()  # [MỚI] Worker chuyên xếp loại học viên
 
 # ============================================================================
-# 4. HELPER FUNCTIONS (Hàm phụ trợ)
+# 4. HELPER FUNCTIONS
 # ============================================================================
-
 def save_metadata(doc_id, title, description, filename, original_name):
-    """Lưu thông tin bài giảng vào file JSON"""
     if not os.path.exists(METADATA_FILE):
         with open(METADATA_FILE, 'w', encoding='utf-8') as f: json.dump([], f)
     
     try:
-        with open(METADATA_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except:
-        data = []
+        with open(METADATA_FILE, 'r', encoding='utf-8') as f: data = json.load(f)
+    except: data = []
     
-    # Thêm bản ghi mới
     new_record = {
         "id": doc_id,
         "title": title,
         "description": description,
-        "filename": filename,           # Tên file hệ thống (để AI đọc)
-        "original_name": original_name, # Tên file gốc (để hiển thị)
+        "filename": filename,
+        "original_name": original_name,
         "created_at": str(os.path.getmtime(os.path.join(UPLOAD_DIR, filename)))
     }
     data.append(new_record)
@@ -101,125 +93,119 @@ def save_metadata(doc_id, title, description, filename, original_name):
 
 @app.get("/")
 async def root():
-    return {"message": "AI Learning Backend is Running!"}
+    return {"message": "Hệ thống AI Learning đã sẵn sàng!"}
 
-# --- API 1: GIÁO VIÊN UPLOAD (Lưu File + Tiêu đề + Mô tả) ---
+# --- 1. UPLOAD TÀI LIỆU ---
 @app.post("/teacher/upload")
-async def teacher_upload(
-    file: UploadFile = File(...), 
-    title: str = Form(...),       
-    description: str = Form(...)  
-):
+async def teacher_upload(file: UploadFile = File(...), title: str = Form(...), description: str = Form(...)):
     try:
-        # 1. Tạo tên file an toàn (tránh trùng lặp)
         safe_filename = f"{uuid.uuid4().hex}_{file.filename}"
         file_path = os.path.join(UPLOAD_DIR, safe_filename)
         
-        # 2. Lưu file vật lý vào ổ cứng
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
-        # 3. Content Agent học bài (Xử lý file)
-        print(f"\n🤖 Content Agent đang học: {file.filename}...")
+        print(f"🤖 Content Agent đang học: {file.filename}...")
         success = content_worker.process_and_store(file_path, safe_filename)
         
         if not success:
-            raise HTTPException(status_code=400, detail="Không đọc được nội dung file PDF")
+            raise HTTPException(status_code=400, detail="Lỗi đọc nội dung file")
 
-        # 4. Lưu thông tin vào kho đề (Metadata)
         doc_id = str(uuid.uuid4())
         saved_info = save_metadata(doc_id, title, description, safe_filename, file.filename)
         
-        return {
-            "status": "success", 
-            "message": "Đã thêm tài liệu vào kho tri thức thành công!", 
-            "data": saved_info
-        }
+        return {"status": "success", "message": "Đã thêm tài liệu thành công!", "data": saved_info}
     except Exception as e:
-        print(f"❌ Lỗi Upload: {str(e)}")
         return {"status": "error", "message": str(e)}
 
-# --- API 2: HỌC SINH LẤY DANH SÁCH ĐỀ ---
+# --- 2. LẤY DANH SÁCH BÀI ---
 @app.get("/student/documents")
 async def get_documents():
-    """Trả về danh sách các bài học đang có trong hệ thống"""
-    if not os.path.exists(METADATA_FILE): 
-        return []
+    if not os.path.exists(METADATA_FILE): return []
     try:
-        with open(METADATA_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except:
-        return []
+        with open(METADATA_FILE, 'r', encoding='utf-8') as f: return json.load(f)
+    except: return []
 
-# --- API 3: SINH ĐỀ NGẪU NHIÊN (Assessment Agent) ---
+# --- 3. SINH ĐỀ THI (ASSESSMENT AGENT) ---
 @app.post("/student/generate-quiz")
 async def generate_quiz(request: dict):
-    print("\n\n==================================================")
-    print("🚀 [DEBUG] API /student/generate-quiz ĐÃ NHẬN REQUEST!")
-    
     filename = request.get("filename")
-    print(f"📂 [DEBUG] Filename nhận được: {filename}")
-    
-    if not filename:
-        print("❌ [LỖI] Không có filename gửi lên!")
-        return {"error": "Thiếu tên file"}
+    if not filename: return {"error": "Thiếu tên file"}
 
     try:
-        print("⏳ [DEBUG] Đang gọi assessment_worker.generate_quiz()...")
-        
-        # Gọi Agent sinh câu hỏi
+        print(f"⏳ Đang sinh câu hỏi cho bài: {filename}...")
         quiz = assessment_worker.generate_quiz(topic=filename)
-        
-        # Kiểm tra kết quả trả về
-        if not quiz or len(quiz) == 0:
-            print("⚠️ [CẢNH BÁO] Agent trả về rỗng -> Kích hoạt Fallback.")
-            raise ValueError("Agent returned empty list")
-            
-        print(f"✅ [DEBUG] Trả về {len(quiz)} câu hỏi cho Frontend.")
+        if not quiz: raise ValueError("AI trả về rỗng")
         return quiz
-
     except Exception as e:
-        print(f"❌ [CRITICAL ERROR] Lỗi sinh quiz: {str(e)}")
-        # TRẢ VỀ CÂU HỎI MẪU ĐỂ FRONTEND KHÔNG BỊ TREO
+        print(f"❌ Lỗi sinh quiz: {str(e)}")
+        # Fallback data
         return [
-            {
-                "id": 1, 
-                "question": f"Hệ thống đang gặp sự cố nhỏ ({str(e)}). Bạn có thấy câu hỏi này không?", 
-                "options": ["A. Có, tôi thấy", "B. Không"], 
-                "answer": "A"
-            },
-            {
-                "id": 2, 
-                "question": "1 + 1 = ?", 
-                "options": ["A. 2", "B. 3", "C. 4", "D. 5"], 
-                "answer": "A"
-            }
+            {"id": 1, "question": "1 + 1 = ?", "options": ["A. 2", "B. 3"], "answer": "A", "difficulty": 1},
+            {"id": 2, "question": "Nước sôi ở bao nhiêu độ?", "options": ["A. 90", "B. 100"], "answer": "B", "difficulty": 1}
         ]
 
-# --- API 4: CHẤM ĐIỂM & NHẬN XÉT (Evaluation Agent Logic) ---
+# --- 4. NỘP BÀI & XẾP LOẠI (PROFILING AGENT) ---
 @app.post("/student/submit-quiz")
 async def submit_quiz(request: dict):
-    """Chấm điểm và nhờ AI nhận xét"""
-    questions = request.get('questions', [])
-    user_answers = request.get('user_answers', {})
-    
-    if not questions:
-        return {"error": "Không có dữ liệu câu hỏi"}
+    """
+    Nhận bài làm -> Chấm điểm -> Gọi Profiling Agent xếp loại
+    """
+    questions = request.get('questions', [])    # Danh sách câu hỏi gốc (có đáp án đúng)
+    user_answers = request.get('user_answers', {}) # Đáp án học viên chọn
+    student_id = request.get('student_id', 'Guest') # ID học viên
 
-    print("👩‍🏫 Đang chấm bài và nhận xét...")
+    if not questions:
+        return {"error": "Dữ liệu câu hỏi bị thiếu."}
+
+    print(f"📝 Đang chấm bài cho học viên: {student_id}...")
+
+    # --- BƯỚC 1: CHẤM ĐIỂM CHI TIẾT ---
+    score = 0
+    details = []
     
-    try:
-        result = assessment_worker.evaluate_and_feedback(questions, user_answers)
-        return result
-    except Exception as e:
-        print(f"❌ Lỗi chấm điểm: {str(e)}")
-        return {
-            "score": 0,
-            "total": len(questions),
-            "feedback": "Lỗi chấm điểm. Nhưng bạn đã làm rất tốt!"
-        }
+    for q in questions:
+        q_id = str(q['id']) # ID câu hỏi
+        correct_ans = q.get('answer', '').strip().upper() # Đáp án đúng (VD: "A")
+        
+        # Đáp án người dùng chọn (Lấy từ frontend gửi lên)
+        user_ans = user_answers.get(f"q_{q_id}", "").strip().upper() 
+        # Lưu ý: Frontend gửi key dạng "q_1", "q_2"... cần khớp với format
+
+        # Nếu user_answers gửi lên dạng {"1": "A"} thay vì {"q_1": "A"}, dùng dòng này:
+        if not user_ans: user_ans = user_answers.get(q_id, "").strip().upper()
+
+        is_correct = (user_ans == correct_ans)
+        if is_correct:
+            score += 1
+            
+        details.append({
+            "question_id": q_id,
+            "is_correct": is_correct,
+            "difficulty": q.get('difficulty', 1) # Mặc định độ khó 1 nếu không có
+        })
+
+    # --- BƯỚC 2: GỌI PROFILING AGENT ---
+    quiz_results_format = {
+        "score": score,
+        "total_questions": len(questions),
+        "details": details
+    }
+
+    # Agent tính toán trọng số và xếp loại
+    profile_result = profiling_worker.update_profile(student_id, quiz_results_format)
+
+    # --- BƯỚC 3: TRẢ KẾT QUẢ VỀ FRONTEND ---
+    print("✅ Đã xếp loại xong:", profile_result)
+    
+    return {
+        "message": "Đã chấm điểm thành công",
+        "score_info": f"{score}/{len(questions)}",
+        "profile": profile_result, # Chứa level: Beginner/Intermediate...
+        # Bạn có thể gọi thêm assessment_worker để lấy lời phê chi tiết nếu muốn
+        # "ai_feedback": assessment_worker.get_feedback(...) 
+    }
 
 if __name__ == "__main__":
     import uvicorn
-    # Reload=True để tự động restart server khi sửa code (chỉ dùng lúc dev)
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
